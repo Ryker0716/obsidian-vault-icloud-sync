@@ -69,6 +69,12 @@ function makePlugin() {
 	p.log = () => {};
 	return p;
 }
+function makePlugin2(settings) {
+	const p = makePlugin();
+	p.settings = Object.assign({}, settings);
+	return p;
+}
+
 function clearFlags() {
 	delete global.__AUTO_CANCEL;
 	delete global.__FORCE_UNCHECKED;
@@ -438,6 +444,236 @@ async function scenario(name, fn) {
 		assert(c && c.ok, `清理应成功：${c && c.message}`);
 		assert.strictEqual(c.dirs, 1, `应移除 1 个空目录，实际 ${c.dirs}`);
 		assert(!fs.existsSync(path.join(BACKUP, 'olddir')), '备份侧冗余空目录应被移除');
+	});
+
+
+	/* ---------------- 1.3.0 修复回归 ---------------- */
+	await scenario('排除规则：中缀斜杠与 rsync 口径一致，不再假新增', async () => {
+		w(path.join(LOCAL, 'a.md'), 'A');
+		w(path.join(LOCAL, 'deep', 'x', 'sub2', 'junk.md'), 'J');
+		const p = makePlugin();
+		p.settings.excludes = ['/.obsidian', '/.vault-sync-trash', '.DS_Store', 'sub2/junk.md'];
+		const first = await p.runSync('manual');
+		assert(first && first.ok, `首次同步应成功：${first && first.message}`);
+		assert(!fs.existsSync(path.join(BACKUP, 'deep', 'x', 'sub2', 'junk.md')), '中缀规则应排除深层文件');
+		assert(!fs.existsSync(path.join(BACKUP, 'a.md')) === false, 'a.md 应被同步');
+		const second = await makePlugin2(p.settings).runSync('manual');
+		assert(second && second.ok);
+		assert.strictEqual(second.created, 0, `第二轮不应再报新增，实际 ${second.created}`);
+		assert.strictEqual(second.updated, 0, `第二轮不应再报更新，实际 ${second.updated}`);
+	});
+
+	await scenario('类型冲突：差异清单可见，备份方向（本地目录压备份文件）', async () => {
+		w(path.join(LOCAL, 'foo', 'inner.md'), 'I');
+		w(path.join(BACKUP, 'foo'), 'old-file');
+		const p = makePlugin();
+		stub.setPlanHook((modal) => {
+			const row = modal.rows.find((r) => r.rel === 'foo');
+			assert.strictEqual(row && row.kind, 'conflict', '类型冲突应作为独立行出现');
+			modal.selected.add('foo');
+			modal.renderRows(true);
+			const btn = [];
+			stub.walk(modal.contentEl, (el) => {
+				if (el.tag === 'button' && /mod-cta/.test(el.cls)) btn.push(el);
+			});
+			btn[0].listeners.click();
+		});
+		const r = await p.openDiffPlan();
+		assert(r && r.ok, `应成功：${r && r.message}`);
+		assert(fs.statSync(path.join(BACKUP, 'foo')).isDirectory(), '备份侧应变成目录');
+		assert.strictEqual(fs.readFileSync(path.join(BACKUP, 'foo', 'inner.md'), 'utf8'), 'I');
+		const trashBase = path.join(BACKUP, '.vault-sync-trash');
+		const batch = fs.readdirSync(trashBase)[0];
+		assert(fs.statSync(path.join(trashBase, batch, 'foo')).isFile(), '原备份文件应进回收目录');
+	});
+
+	await scenario('类型冲突：还原方向（备份目录替换本地文件）', async () => {
+		w(path.join(LOCAL, 'bar'), 'local-file');
+		w(path.join(BACKUP, 'bar', 'inner.md'), 'BI');
+		const p = makePlugin();
+		stub.setPlanHook((modal) => {
+			const row = modal.rows.find((r) => r.rel === 'bar');
+			row.dir = 'pull';
+			modal.selected.add('bar');
+			modal.renderRows(true);
+			const btn = [];
+			stub.walk(modal.contentEl, (el) => {
+				if (el.tag === 'button' && /mod-cta/.test(el.cls)) btn.push(el);
+			});
+			btn[0].listeners.click();
+		});
+		const r = await p.openDiffPlan();
+		assert(r && r.ok, `应成功：${r && r.message}`);
+		assert(fs.statSync(path.join(LOCAL, 'bar')).isDirectory(), '本地侧应变成目录');
+		assert.strictEqual(fs.readFileSync(path.join(LOCAL, 'bar', 'inner.md'), 'utf8'), 'BI');
+		const trashBase = path.join(LOCAL, '.vault-sync-trash');
+		const batch = fs.readdirSync(trashBase)[0];
+		assert(fs.statSync(path.join(trashBase, batch, 'bar')).isFile(), '原本地文件应进回收目录');
+	});
+
+	await scenario('类型冲突：同步不再失败（备份侧先搬回收）', async () => {
+		w(path.join(LOCAL, 'x'), 'local-x');
+		w(path.join(BACKUP, 'x', 'inner.md'), 'old');
+		const p = makePlugin();
+		const r = await p.runSync('manual');
+		assert(r && r.ok, `同步不应再因类型冲突失败：${r && r.message}`);
+		assert(!fs.lstatSync(path.join(BACKUP, 'x')).isDirectory(), '备份侧应被本地文件替换');
+		assert.strictEqual(fs.readFileSync(path.join(BACKUP, 'x'), 'utf8'), 'local-x');
+		assert(r.trashed >= 1, '备份侧原目录应进回收');
+	});
+
+	await scenario('类型冲突：恢复可处理（本地文件被备份目录替换）', async () => {
+		w(path.join(LOCAL, 'y'), 'local-y');
+		w(path.join(BACKUP, 'y', 'inner.md'), 'YI');
+		global.__SELECT_ONLY = ['y'];
+		const p = makePlugin();
+		const r = await p.runRestore();
+		assert(r && r.ok, `恢复应成功：${r && r.message}`);
+		assert(fs.statSync(path.join(LOCAL, 'y')).isDirectory(), '本地侧应变成目录');
+		assert.strictEqual(fs.readFileSync(path.join(LOCAL, 'y', 'inner.md'), 'utf8'), 'YI');
+		const trashBase = path.join(LOCAL, '.vault-sync-trash');
+		const batch = fs.readdirSync(trashBase)[0];
+		assert(fs.statSync(path.join(trashBase, batch, 'y')).isFile(), '原本地文件应进回收目录');
+	});
+
+	await scenario('差异清单弹框期间占用任务锁', async () => {
+		w(path.join(LOCAL, 'a.md'), 'A-local');
+		w(path.join(BACKUP, 'a.md'), 'A-backup');
+		const p = makePlugin();
+		let midSync = null;
+		stub.setPlanHook((modal) => {
+			midSync = p.runSync('manual'); // 弹框打开期间尝试同步
+			modal.rows.forEach((r) => modal.selected.add(r.rel));
+			modal.renderRows(true);
+			const btn = [];
+			stub.walk(modal.contentEl, (el) => {
+				if (el.tag === 'button' && /mod-cta/.test(el.cls)) btn.push(el);
+			});
+			btn[0].listeners.click();
+		});
+		const r = await p.openDiffPlan();
+		assert(r && r.ok, `应成功：${r && r.message}`);
+		assert.strictEqual(await midSync, null, '弹框期间的同步应被任务锁挡住');
+		const again = await p.runSync('manual');
+		assert(again && again.ok, '执行完释放任务锁，后续同步可用');
+	});
+
+	await scenario('占位残留：真身同步后，备份侧占位进回收', async () => {
+		w(path.join(LOCAL, 'foo.md'), 'F');
+		w(path.join(BACKUP, 'a.md'), 'A');
+		w(path.join(LOCAL, 'a.md'), 'A');
+		w(path.join(BACKUP, '.foo.md.icloud'), 'placeholder');
+		const p = makePlugin();
+		const r = await p.runSync('manual');
+		assert(r && r.ok, `同步应成功：${r && r.message}`);
+		assert(fs.existsSync(path.join(BACKUP, 'foo.md')), '真身应被同步到备份');
+		assert(!fs.existsSync(path.join(BACKUP, '.foo.md.icloud')), '真身存在后占位应移入回收');
+		assert(r.trashed >= 1, '应计入 trashed');
+	});
+
+	await scenario('普通 .icloud 文件不再被当成占位（可正常同步）', async () => {
+		w(path.join(LOCAL, 'a.md'), 'A');
+		w(path.join(BACKUP, 'a.md'), 'A');
+		w(path.join(LOCAL, 'report.icloud'), 'R');
+		w(path.join(LOCAL, '.stub.md.icloud'), 'stub');
+		const p = makePlugin();
+		const r = await p.runSync('manual');
+		assert(r && r.ok, `同步应成功：${r && r.message}`);
+		assert(fs.existsSync(path.join(BACKUP, 'report.icloud')), '普通 .icloud 文件应被同步');
+		assert(!fs.existsSync(path.join(BACKUP, '.stub.md.icloud')), '点前缀占位形态不应被同步');
+		const second = await p.runSync('manual');
+		assert(second && second.created === 0 && second.updated === 0, '第二轮不应有假差异');
+	});
+
+	await scenario('备份目录是文件时：各入口都拒绝而不是误报', async () => {
+		const aFile = path.join(TMP, 'not-a-dir');
+		fs.writeFileSync(aFile, 'x');
+		w(path.join(LOCAL, 'a.md'), 'A');
+		const p = makePlugin();
+		p.settings.remoteRoot = aFile;
+		assert.strictEqual(await p.runSync('manual'), null, '同步应拒绝');
+		assert.strictEqual(await p.runCleanRemote(), null, '清理应拒绝（不能误报一致）');
+		assert.strictEqual(await p.runRestore(), null, '恢复应拒绝');
+	});
+
+	await scenario('执行前重验：差异清单还原方向不覆盖扫描后的本地新改动', async () => {
+		w(path.join(LOCAL, 'b.md'), 'B1');
+		w(path.join(BACKUP, 'b.md'), 'B2-backup-long');
+		const p = makePlugin();
+		stub.setPlanHook((modal) => {
+			// 扫描已完成、尚未确认：模拟用户在弹框期间又改了本地文件
+			fs.writeFileSync(path.join(LOCAL, 'b.md'), 'B3-new');
+			const now = Math.floor(Date.now() / 1000);
+			fs.utimesSync(path.join(LOCAL, 'b.md'), now, now);
+			const row = modal.rows.find((r) => r.rel === 'b.md');
+			row.dir = 'pull';
+			modal.selected.add('b.md');
+			modal.renderRows(true);
+			const btn = [];
+			stub.walk(modal.contentEl, (el) => {
+				if (el.tag === 'button' && /mod-cta/.test(el.cls)) btn.push(el);
+			});
+			btn[0].listeners.click();
+		});
+		const r = await p.openDiffPlan();
+		assert(r && r.ok, `应成功：${r && r.message}`);
+		assert.strictEqual(fs.readFileSync(path.join(LOCAL, 'b.md'), 'utf8'), 'B3-new', '扫描后的新改动不能被覆盖');
+		assert.strictEqual(r.skipped, 1, `应记 1 项跳过，实际 ${r.skipped}`);
+	});
+
+	await scenario('执行前重验：恢复不覆盖扫描后的本地新改动', async () => {
+		w(path.join(LOCAL, 'b.md'), 'B1');
+		w(path.join(BACKUP, 'b.md'), 'B2-longer');
+		global.__SELECT_ONLY = ['b.md'];
+		const p = makePlugin();
+		global.__SELECT_ONLY = null;
+		stub.setPlanHook((modal) => {
+			fs.writeFileSync(path.join(LOCAL, 'b.md'), 'B3-new');
+			const now = Math.floor(Date.now() / 1000);
+			fs.utimesSync(path.join(LOCAL, 'b.md'), now, now);
+			return false; // 继续正常的勾选+确认流程
+		});
+		global.__SELECT_ONLY = ['b.md'];
+		const r = await p.runRestore();
+		global.__SELECT_ONLY = null;
+		assert(r && r.ok, `恢复应成功：${r && r.message}`);
+		assert.strictEqual(fs.readFileSync(path.join(LOCAL, 'b.md'), 'utf8'), 'B3-new', '扫描后的新改动不能被覆盖');
+		assert.strictEqual(r.skipped, 1, `应记 1 项跳过，实际 ${r.skipped}`);
+	});
+
+	await scenario('大清单分块渲染（恢复弹框一次 300 行）', async () => {
+		w(path.join(LOCAL, 'a.md'), 'A');
+		w(path.join(BACKUP, 'a.md'), 'A');
+		for (let i = 0; i < 305; i += 1) {
+			w(path.join(BACKUP, `f${String(i).padStart(3, '0')}.md`), `F${i}`);
+		}
+		let chunkInfo = null;
+		stub.setPlanHook((modal) => {
+			chunkInfo = {
+				rows: modal.listEl ? modal.listEl.children.length : -1,
+				more: modal.moreEl ? modal.moreEl.children.length : -1,
+			};
+			modal.close();
+		});
+		const r = await makePlugin().runRestore();
+		assert.strictEqual(r, null, '未勾选应取消');
+		assert(chunkInfo, '应打开弹框');
+		assert.strictEqual(chunkInfo.rows, 300, `首屏应渲染 300 行，实际 ${chunkInfo.rows}`);
+		assert.strictEqual(chunkInfo.more, 1, '应有「再显示」按钮');
+	});
+
+	await scenario('「一致」提示包含 iCloud 多余数', async () => {
+		w(path.join(LOCAL, 'a.md'), 'A');
+		w(path.join(BACKUP, 'a.md'), 'A');
+		w(path.join(BACKUP, 'extra.md'), 'E');
+		const before = stub.notices.length;
+		const p = makePlugin();
+		p.settings.notifyOnNoChange = true;
+		const r = await p.runSync('manual');
+		assert(r && r.ok);
+		const msg = stub.notices.slice(before).find((n) => n.indexOf('无需同步') !== -1);
+		assert(msg, '应有一致提示');
+		assert(msg.indexOf('多余 1') !== -1, `提示应含多余数：${msg}`);
 	});
 
 	console.log('\n' + results.join('\n'));
