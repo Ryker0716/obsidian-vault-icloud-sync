@@ -418,6 +418,10 @@ class VaultICloudSyncPlugin extends Plugin {
 	baseArgs() {
 		const args = ['-a'];
 		if (this.settings.checksum) args.push('-c');
+		// iCloud 未下载的占位文件（.xxx.md.icloud）rsync 一律不碰：
+		// 没有这条，镜像删除的 --delete 会把它们硬删——占位就是该文件在 iCloud 的本体表示，
+		// 删掉等于连云端一起删，而且绕过回收目录（接收端 exclude 能挡住 --delete）
+		args.push('--exclude=*.icloud');
 		for (const raw of this.settings.excludes || []) {
 			const ex = String(raw || '').trim();
 			if (ex) args.push(`--exclude=${ex}`);
@@ -506,18 +510,21 @@ class VaultICloudSyncPlugin extends Plugin {
 		return /\.icloud$/i.test(rel);
 	}
 
-	/** 从目录树里剔除 iCloud 未下载的占位文件，返回 { tree, count } */
+	/** 从目录树里剔除 iCloud 未下载的占位文件，返回 { tree, count, names }；names = 占位对应的真实文件名 */
 	stripPlaceholders(tree) {
 		const kept = new Map();
+		const names = new Set();
 		let count = 0;
 		for (const [rel, ent] of tree) {
 			if (!ent.dir && this.isPlaceholder(rel)) {
 				count += 1;
+				// sub/.foo.md.icloud 对应 sub/foo.md
+				names.add(rel.replace(/(^|\/)\./, '$1').replace(/\.icloud$/i, ''));
 				continue;
 			}
 			kept.set(rel, ent);
 		}
-		return { tree: kept, count };
+		return { tree: kept, count, names };
 	}
 
 	/** 单文件（或符号链接）从 srcRoot 复制到 dstRoot，并保留源侧修改时间 */
@@ -533,6 +540,12 @@ class VaultICloudSyncPlugin extends Plugin {
 			}
 			fs.symlinkSync(ent.link, to);
 			return;
+		}
+		// 目标若是符号链接，先摘掉再写：copyFileSync 会跟随链接，把内容写进它指向的外部文件
+		try {
+			if (fs.lstatSync(to).isSymbolicLink()) fs.unlinkSync(to);
+		} catch (e) {
+			/* 目标不存在 */
 		}
 		fs.copyFileSync(from, to);
 		if (ent && typeof ent.mtime === 'number') {
@@ -623,6 +636,14 @@ class VaultICloudSyncPlugin extends Plugin {
 				`扫描完成（本地 ${local.size} 项 / iCloud ${remote.size} 项）：` +
 					`新增 ${record.created} · 更新 ${record.updated} · iCloud 多余 ${record.extra}`
 			);
+
+			/* 镜像删除安全闸：本地扫不到任何文件时中止，防止配置错误把整份备份搬空（与「清理」同一守卫） */
+			if (this.settings.mirrorDelete && record.extra > 0 && this.countFiles(local) === 0) {
+				throw new Error(
+					`本地 vault 没有扫到任何文件，而备份里有 ${record.extra} 个多余项；` +
+						'为防止搬空备份，本次已中止，未做任何改动。请检查本地目录配置。'
+				);
+			}
 
 			const hasDiff = record.created + record.updated > 0;
 
@@ -743,7 +764,13 @@ class VaultICloudSyncPlugin extends Plugin {
 			// 注意方向：compareTrees 的 created/updated 是「本地 → 备份」口径，
 			// 恢复（备份 → 本地）时，备份独有的才是新增、两边都有但不同的才是覆盖。
 			const incoming = this.splitEntries(remote, diff.extra);
-			const localExtra = this.splitEntries(local, diff.created);
+			// 备份里被 iCloud 驱逐成占位（.foo.md.icloud）的文件，其本地同名版本不算「本地独有」，
+			// 否则勾选「完全一致」会把活笔记搬进回收站
+			const evicted = [...remoteScan.names].filter((n) => local.has(n)).length;
+			const localExtra = this.splitEntries(
+				local,
+				diff.created.filter((rel) => !remoteScan.names.has(rel))
+			);
 			const localFiles = this.countFiles(local);
 			const overwriteFiles = diff.updated.filter((rel) => !(remote.get(rel) || {}).dir);
 			const createdSet = new Set(incoming.files);
@@ -782,6 +809,12 @@ class VaultICloudSyncPlugin extends Plugin {
 			}
 			if (localExtra.files.length) {
 				warns.push(`本地有 ${localExtra.files.length} 个文件在备份里不存在，默认保留不动。`);
+			}
+			if (evicted) {
+				warns.push(
+					`另有 ${evicted} 个文件在备份里尚未下载（.icloud 占位），无法比较；` +
+						'它们不计入「本地独有」，勾选「完全一致」也不会被移走。'
+				);
 			}
 
 			const answer = await new ConfirmModal(this.app, {
@@ -958,12 +991,22 @@ class VaultICloudSyncPlugin extends Plugin {
 			const extra = this.splitEntries(remote, diff.extra);
 			if (!extra.files.length) {
 				record.ok = true;
-				record.message = '备份与本地一致，没有冗余文件。';
 				record.duration = Math.round((Date.now() - started) / 100) / 10;
+				if (extra.dirs.length) {
+					// 只剩空目录：不承载数据，直接移除并记录
+					const pruned = this.pruneEmptyDirs(paths.remoteRoot, extra.dirs);
+					record.dirs = pruned.length;
+					record.samples = pruned.slice(0, SAMPLE_LIMIT);
+					record.message = `没有冗余文件；移除了 ${pruned.length} 个备份侧冗余空目录。`;
+					this.log(`清理：无冗余文件，移除空目录 ${pruned.length} 个`);
+					new Notice(`✅ 没有冗余文件；顺手移除了 ${pruned.length} 个空目录`, 8000);
+				} else {
+					record.message = '备份与本地一致，没有冗余文件。';
+					this.log('清理检查：备份没有冗余文件');
+					new Notice('✅ 备份与本地一致，没有冗余文件', 6000);
+				}
 				this.state.lastClean = record;
 				await this.saveAll();
-				this.log('清理检查：备份没有冗余文件');
-				new Notice('✅ 备份与本地一致，没有冗余文件', 6000);
 				return record;
 			}
 
@@ -1074,14 +1117,20 @@ class VaultICloudSyncPlugin extends Plugin {
 		const scanNotice = new Notice('正在比对本地与备份…', 0);
 		let rows = [];
 		const byRel = new Map();
+		const dirStats = { localOnly: 0, remoteOnly: 0 };
 		try {
+			this.hashCache = new Map(); // 与其余入口一致：每次扫描重新计算内容哈希
 			const local = this.walkTree(paths.localRoot);
 			const remoteScan = this.stripPlaceholders(this.walkTree(paths.remoteRoot));
 			const remote = remoteScan.tree;
 			const diff = this.compareTrees(local, remote);
 
-			const localOnly = this.splitEntries(local, diff.created).files;
-			const remoteOnly = this.splitEntries(remote, diff.extra).files;
+			const localOnlyAll = this.splitEntries(local, diff.created);
+			const remoteOnlyAll = this.splitEntries(remote, diff.extra);
+			const localOnly = localOnlyAll.files;
+			const remoteOnly = remoteOnlyAll.files;
+			dirStats.localOnly = localOnlyAll.dirs.length;
+			dirStats.remoteOnly = remoteOnlyAll.dirs.length;
 			const both = diff.updated.filter((rel) => {
 				const l = local.get(rel);
 				const r = remote.get(rel);
@@ -1123,8 +1172,17 @@ class VaultICloudSyncPlugin extends Plugin {
 		}
 
 		if (!rows.length) {
-			new Notice('✅ 本地与备份一致，没有差异', 6000);
-			this.log('差异扫描：两边一致');
+			if (dirStats.localOnly + dirStats.remoteOnly) {
+				new Notice(
+					`两边文件一致，但有 ${dirStats.localOnly + dirStats.remoteOnly} 个空目录差异（本地独有 ${dirStats.localOnly} · 备份独有 ${dirStats.remoteOnly}）；` +
+						'「立即同步」会补齐本地侧的空目录',
+					10000
+				);
+				this.log(`差异扫描：文件一致，空目录差异 ${dirStats.localOnly + dirStats.remoteOnly} 个`);
+			} else {
+				new Notice('✅ 本地与备份一致，没有差异', 6000);
+				this.log('差异扫描：两边一致');
+			}
 			return null;
 		}
 
@@ -1142,7 +1200,16 @@ class VaultICloudSyncPlugin extends Plugin {
 				['本地独有', `${count.localOnly} 个（只能备份）`],
 				['两边不同', `${count.both} 个（可备份或还原）`],
 				['备份独有', `${count.remoteOnly} 个（只能还原）`],
-			],
+			].concat(
+				dirStats.localOnly + dirStats.remoteOnly
+					? [
+							[
+								'空目录差异',
+								`${dirStats.localOnly + dirStats.remoteOnly} 个（不在下方清单；「立即同步」会补齐本地侧）`,
+							],
+						]
+					: []
+			),
 			warns: [
 				'「备份」会用本地版本覆盖备份，「还原」会用备份版本覆盖本地；两个方向都会覆盖对方那一侧的同名文件。',
 			],

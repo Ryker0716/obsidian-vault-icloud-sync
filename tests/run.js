@@ -335,6 +335,111 @@ async function scenario(name, fn) {
 		}
 	});
 
+
+	/* ---------------- 1.2.1 修复回归 ---------------- */
+	await scenario('镜像删除：iCloud 占位不被 rsync 硬删，普通冗余仍进回收', async () => {
+		w(path.join(LOCAL, 'a.md'), 'A');
+		w(path.join(BACKUP, 'a.md'), 'A');
+		w(path.join(BACKUP, 'gone.md'), 'G');
+		w(path.join(BACKUP, '.gone.md.icloud'), 'placeholder');
+		const p = makePlugin();
+		p.settings.mirrorDelete = true;
+		const r = await p.runSync('manual');
+		assert(r && r.ok, `同步应成功：${r && r.message}`);
+		assert(!fs.existsSync(path.join(BACKUP, 'gone.md')), '普通冗余应进回收');
+		assert(fs.existsSync(path.join(BACKUP, '.gone.md.icloud')), '占位文件不能被 rsync --delete 硬删');
+	});
+
+	await scenario('差异处理：目标是符号链接时不穿透覆写链接目标', async () => {
+		const target = path.join(TMP, 'outside-target.txt');
+		fs.writeFileSync(target, 'KEEP-ME');
+		w(path.join(LOCAL, 'x.md'), 'local-content');
+		fs.symlinkSync(target, path.join(BACKUP, 'x.md'));
+		const p = makePlugin();
+		stub.setPlanHook((modal) => {
+			for (const r of modal.rows) {
+				if (r.localEnt) {
+					r.dir = 'push';
+					modal.selected.add(r.rel);
+				}
+			}
+			modal.renderRows(true);
+			const btn = [];
+			stub.walk(modal.contentEl, (el) => {
+				if (el.tag === 'button' && /mod-cta/.test(el.cls)) btn.push(el);
+			});
+			btn[0].listeners.click();
+		});
+		const r = await p.openDiffPlan();
+		assert(r && r.ok, `应成功：${r && r.message}`);
+		assert.strictEqual(fs.readFileSync(target, 'utf8'), 'KEEP-ME', '链接指向的外部文件不能被覆写');
+		assert(!fs.lstatSync(path.join(BACKUP, 'x.md')).isSymbolicLink(), '备份侧应变成普通文件');
+		assert.strictEqual(fs.readFileSync(path.join(BACKUP, 'x.md'), 'utf8'), 'local-content');
+	});
+
+	await scenario('镜像删除：本地为空时中止，备份不被搬空', async () => {
+		w(path.join(BACKUP, 'a.md'), 'A');
+		w(path.join(BACKUP, 'b.md'), 'B');
+		const p = makePlugin();
+		p.settings.mirrorDelete = true;
+		const r = await p.runSync('manual');
+		assert(r && !r.ok, '应判失败并中止');
+		assert(/中止/.test(r.message), `提示应说明中止：${r.message}`);
+		assert(fs.existsSync(path.join(BACKUP, 'a.md')), '备份文件必须原样保留');
+		assert(fs.existsSync(path.join(BACKUP, 'b.md')), '备份文件必须原样保留');
+		assert(!fs.existsSync(path.join(BACKUP, '.vault-sync-trash')), '不应产生回收动作');
+	});
+
+	await scenario('恢复：备份同名文件被驱逐成占位时，不计入本地独有', async () => {
+		w(path.join(LOCAL, 'foo.md'), 'alive');
+		w(path.join(LOCAL, 'real.md'), 'R');
+		w(path.join(BACKUP, 'real.md'), 'R');
+		w(path.join(BACKUP, '.foo.md.icloud'), 'placeholder');
+		const p = makePlugin();
+		const r = await p.runRestore();
+		assert(r && r.ok, `恢复应成功：${r && r.message}`);
+		assert.strictEqual(r.trashed, 0, '备份里只是没下载的活笔记不能被搬进回收');
+		assert(fs.existsSync(path.join(LOCAL, 'foo.md')), 'foo.md 必须原地保留');
+	});
+
+	await scenario('MD5 模式：同步后改同大小文件，差异清单仍能发现', async () => {
+		w(path.join(LOCAL, 'a.md'), 'AAAA');
+		w(path.join(BACKUP, 'a.md'), 'AAAA'); // 先让两边一致，把「相等」的哈希留在缓存里
+		const p = makePlugin();
+		p.settings.checksum = true;
+		const sync = await p.runSync('manual');
+		assert(sync && sync.ok, `先同步一次：${sync && sync.message}`);
+		w(path.join(LOCAL, 'a.md'), 'CCCC'); // 同大小，仅内容变化，mtime 也保持不变
+		let seen = -1;
+		stub.setPlanHook((modal) => {
+			seen = modal.rows.length;
+			modal.close();
+		});
+		const r = await p.openDiffPlan();
+		assert.strictEqual(seen, 1, `差异清单应列出 1 条，实际 ${seen}`);
+		assert.strictEqual(r, null, '未勾选不执行');
+	});
+
+	await scenario('空目录：仅检查差异会提示，清理会移除备份侧冗余空目录', async () => {
+		w(path.join(LOCAL, 'a.md'), 'A');
+		w(path.join(BACKUP, 'a.md'), 'A');
+		fs.mkdirSync(path.join(LOCAL, 'newdir'));
+		fs.mkdirSync(path.join(BACKUP, 'olddir'));
+		const before = stub.notices.length;
+		const p = makePlugin();
+		stub.setPlanHook(() => {});
+		const r = await p.openDiffPlan();
+		assert.strictEqual(r, null);
+		assert(
+			stub.notices.slice(before).some((n) => /空目录差异/.test(n)),
+			'应提示空目录差异而不是声称完全一致'
+		);
+		const c = await makePlugin().runCleanRemote();
+		assert(c && c.ok, `清理应成功：${c && c.message}`);
+		assert.strictEqual(c.dirs, 1, `应移除 1 个空目录，实际 ${c.dirs}`);
+		assert(!fs.existsSync(path.join(BACKUP, 'olddir')), '备份侧冗余空目录应被移除');
+	});
+
 	console.log('\n' + results.join('\n'));
 	console.log(process.exitCode ? '\n❌ 有失败用例' : '\n✅ 全部通过');
 	fs.rmSync(TMP, { recursive: true, force: true });
