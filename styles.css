@@ -1,0 +1,119 @@
+/* vault-icloud-sync 样式 */
+
+.vault-icloud-sync-modal h2 {
+  margin-top: 0;
+}
+
+.vault-icloud-sync-modal .vault-icloud-sync-kv {
+  margin: 0.35em 0;
+  line-height: 1.6;
+}
+
+.vault-icloud-sync-modal pre {
+  max-height: 300px;
+  overflow: auto;
+  padding: 8px;
+  border-radius: 6px;
+  background-color: var(--background-secondary);
+  font-size: var(--font-ui-smaller, 12px);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.vault-icloud-sync-modal .vault-icloud-sync-warn {
+  margin: 0.35em 0;
+  line-height: 1.6;
+  color: var(--text-warning, var(--text-error));
+}
+
+.vault-icloud-sync-modal .vault-icloud-sync-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 1.2em;
+}
+
+.vault-icloud-sync-modal .vault-icloud-sync-buttons button.mod-warning {
+  border-color: var(--text-error);
+  background-color: var(--text-error);
+  color: #fff;
+}
+
+.vault-icloud-sync-modal .vault-icloud-sync-buttons button.mod-warning:hover {
+  background-color: var(--text-error);
+  color: #fff;
+  filter: brightness(1.08);
+}
+
+.vault-icloud-sync-modal .vault-icloud-sync-list-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0.8em 0 0.4em;
+  flex-wrap: wrap;
+}
+
+.vault-icloud-sync-modal .vault-icloud-sync-list-bar input[type='text'] {
+  flex: 1;
+  min-width: 140px;
+}
+
+.vault-icloud-sync-modal .vault-icloud-sync-count {
+  font-size: var(--font-ui-smaller, 12px);
+  color: var(--text-muted);
+}
+
+.vault-icloud-sync-modal .vault-icloud-sync-list {
+  max-height: 42vh;
+  overflow: auto;
+  padding: 6px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background-color: var(--background-secondary);
+}
+
+.vault-icloud-sync-modal .vault-icloud-sync-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 0;
+  font-size: var(--font-ui-smaller, 12px);
+  line-height: 1.5;
+}
+
+.vault-icloud-sync-modal .vault-icloud-sync-item input {
+  margin: 0;
+  flex: 0 0 auto;
+}
+
+.vault-icloud-sync-modal .vault-icloud-sync-note {
+  flex: 0 0 auto;
+  min-width: 3.2em;
+  color: var(--text-muted);
+}
+
+.vault-icloud-sync-modal .vault-icloud-sync-path {
+  word-break: break-all;
+}
+
+.vault-icloud-sync-modal .vault-icloud-sync-dir {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  height: 1.6em;
+  line-height: 1.4em;
+  font-size: var(--font-ui-smaller, 12px);
+  border-radius: 4px;
+  border: 1px solid var(--background-modifier-border);
+  background-color: var(--background-primary);
+  cursor: pointer;
+}
+
+.vault-icloud-sync-modal .vault-icloud-sync-dir.is-fixed {
+  cursor: default;
+  color: var(--text-muted);
+}
+
+.vault-icloud-sync-modal .vault-icloud-sync-more {
+  margin-top: 6px;
+  text-align: center;
+}
