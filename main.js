@@ -488,8 +488,13 @@ class VaultICloudSyncPlugin extends Plugin {
 		for (const rel of extras) {
 			const from = path.join(remoteRoot, rel);
 			const to = path.join(dir, rel);
+			let st;
 			try {
-				const st = fs.existsSync(from) ? fs.lstatSync(from) : null;
+				st = fs.lstatSync(from); // 悬空符号链接 existsSync 会返回 false，lstat 才检得出本体
+			} catch (e) {
+				continue;
+			}
+			try {
 				if (!st) continue;
 				if (st.isDirectory()) continue; // 目录交给 rsync --delete 清
 				fs.mkdirSync(path.dirname(to), { recursive: true });
@@ -532,11 +537,16 @@ class VaultICloudSyncPlugin extends Plugin {
 	}
 
 	/** 把 root 下的单个路径（文件或整棵目录）搬进回收目录；batch 相同则进同一批次；成功返回目标路径 */
+	/** 返回值：路径字符串=成功；null=路径不存在（无动作，不算失败）；''=真实失败 */
 	movePathToTrash(root, rel, batch) {
 		const from = path.join(root, rel);
 		const to = path.join(root, TRASH_DIR_NAME, batch || stamp(), rel);
 		try {
-			if (!fs.existsSync(from)) return '';
+			fs.lstatSync(from); // 悬空符号链接 existsSync 会误判不存在，一律用 lstat
+		} catch (e) {
+			return null;
+		}
+		try {
 			fs.mkdirSync(path.dirname(to), { recursive: true });
 			fs.renameSync(from, to);
 			return to;
@@ -598,7 +608,7 @@ class VaultICloudSyncPlugin extends Plugin {
 
 	/** iCloud 未下载的占位文件：.foo.md.icloud（点前缀 + .icloud 后缀；普通文件 x.icloud 不算） */
 	isPlaceholder(rel) {
-		return /(^|\/)\..+\.icloud$/.test(rel);
+		return /(^|\/)\.[^/]*\.icloud$/.test(rel);
 	}
 
 	/** 从目录树里剔除 iCloud 未下载的占位文件，返回 { tree, count, names, list } */
@@ -609,7 +619,7 @@ class VaultICloudSyncPlugin extends Plugin {
 		let count = 0;
 		for (const [rel, ent] of tree) {
 			if (!ent.dir && this.isPlaceholder(rel)) {
-				const name = rel.replace(/(^|\/)\./, '$1').replace(/\.icloud$/i, '');
+				const name = rel.replace(/(^|\/)\.([^/]+)\.icloud$/, '$1$2');
 				count += 1;
 				names.add(name); // sub/.foo.md.icloud 对应 sub/foo.md
 				list.push({ rel, name });
@@ -765,11 +775,26 @@ class VaultICloudSyncPlugin extends Plugin {
 			const args = this.baseArgs();
 			if (this.settings.mirrorDelete) {
 				if (diff.extra.length) {
-					const trashed = this.moveExtrasToTrash(paths.remoteRoot, diff.extra);
+					// 与「按备份恢复」镜像对称：本地被 iCloud 驱逐成占位的文件，其备份真身不算冗余
+					const extraRels = diff.extra.filter((rel) => !localScan.names.has(rel));
+					const evictedLocal = diff.extra.length - extraRels.length;
+					if (evictedLocal) {
+						this.log(`镜像删除豁免 ${evictedLocal} 个（本地未下载、呈占位形态）`);
+						// 豁免只是不搬进回收，--delete 仍会删——同样逐个加 exclude 保护到下一轮
+						for (const rel of diff.extra.filter((r) => localScan.names.has(r))) {
+							args.push(`--exclude=${rel}`);
+						}
+					}
+					const trashed = this.moveExtrasToTrash(paths.remoteRoot, extraRels);
 					record.trashed = trashed.moved.length;
 					this.log(`已移入回收目录 ${trashed.moved.length} 项 → ${trashed.dir || '(无)'}`);
 					if (trashed.failed.length) {
 						this.log(`⚠️ 有 ${trashed.failed.length} 项未能移入回收目录：${trashed.failed[0]}`);
+						// 没搬走的留在原地，--delete 会连它们一起硬删——逐个加 exclude 保护到下一轮
+						for (const f of trashed.failed) {
+							const rel = f.split('（')[0];
+							args.push(`--exclude=${rel}`);
+						}
 					}
 				}
 				args.push('--delete');
@@ -1032,7 +1057,8 @@ class VaultICloudSyncPlugin extends Plugin {
 							if (!st || !!l.dir !== st.isDirectory()) {
 								skipped.push(rel);
 							} else {
-								if (!this.movePathToTrash(paths.localRoot, rel, stamp())) {
+								const movedTrash = this.movePathToTrash(paths.localRoot, rel, stamp());
+								if (movedTrash === '') {
 									throw new Error('本地路径未能移入回收目录');
 								}
 								const res = this.copyTreePrefix(paths.remoteRoot, paths.localRoot, remote, rel);
@@ -1047,7 +1073,12 @@ class VaultICloudSyncPlugin extends Plugin {
 							else record.updated += 1;
 						}
 					} catch (e) {
-						failed.push(`${rel}（${e.message}）`);
+						if (e && (e.code === 'EEXIST' || e.code === 'ENOTDIR')) {
+							// 父路径被同名冲突文件挡着：属「要先选父冲突行」的情形，按跳过算
+							skipped.push(rel);
+						} else {
+							failed.push(`${rel}（${e.message}）`);
+						}
 					}
 					if (notice && typeof notice.setMessage === 'function' && i % 25 === 0) {
 						notice.setMessage(`正在恢复 ${i + 1}/${picked.length}…`);
@@ -1090,12 +1121,12 @@ class VaultICloudSyncPlugin extends Plugin {
 			if (!record.ok) {
 				new Notice(`⚠️ 恢复有失败项\n${body}\n详见日志`, 15000);
 			} else if (record.created + record.updated === 0) {
-				new Notice(
-					record.trashed
+				const zeroText = record.skipped
+					? `ℹ️ 勾选的 ${record.skipped} 项在扫描后都发生了变动，已全部跳过（未做任何改动）`
+					: record.trashed
 						? `✅ 已把 ${record.trashed} 个本地独有文件移入回收目录`
-						: '✅ 已确认：本地内容与备份一致',
-					8000
-				);
+						: '✅ 已确认：本地内容与备份一致';
+				new Notice(zeroText, 8000);
 			} else {
 				new Notice(`✅ 已按备份恢复\n${body}\n请重载 Obsidian（Cmd+R）刷新界面`, 12000);
 			}
@@ -1370,7 +1401,7 @@ class VaultICloudSyncPlugin extends Plugin {
 			if (dirStats.localOnly + dirStats.remoteOnly) {
 				new Notice(
 					`两边文件一致，但有 ${dirStats.localOnly + dirStats.remoteOnly} 个空目录差异（本地独有 ${dirStats.localOnly} · 备份独有 ${dirStats.remoteOnly}）；` +
-						'「立即同步」会补齐本地侧的空目录',
+						'「立即同步」会把本地独有的补到备份；备份独有的请用「清理备份冗余」移除',
 					10000
 				);
 				this.log(`差异扫描：文件一致，空目录差异 ${dirStats.localOnly + dirStats.remoteOnly} 个`);
@@ -1381,12 +1412,21 @@ class VaultICloudSyncPlugin extends Plugin {
 			return null;
 		}
 
-		const count = { localOnly: 0, both: 0, remoteOnly: 0, conflict: 0 };
+		const count = { localOnly: 0, both: 0, remoteOnly: 0, conflict: 0, newerLocal: 0 };
 		for (const r of rows) {
 			if (r.kind === 'local-only') count.localOnly += 1;
 			else if (r.kind === 'both') count.both += 1;
 			else if (r.kind === 'conflict') count.conflict += 1;
 			else count.remoteOnly += 1;
+			if (
+				r.kind === 'both' &&
+				r.localEnt &&
+				r.remoteEnt &&
+				typeof r.localEnt.mtime === 'number' &&
+				r.localEnt.mtime > r.remoteEnt.mtime
+			) {
+				count.newerLocal += 1;
+			}
 		}
 
 		const answer = await new DiffPlanModal(this.app, rows, {
@@ -1407,7 +1447,7 @@ class VaultICloudSyncPlugin extends Plugin {
 					? [
 							[
 								'空目录差异',
-								`${dirStats.localOnly + dirStats.remoteOnly} 个（不在下方清单；「立即同步」会补齐本地侧）`,
+								`${dirStats.localOnly + dirStats.remoteOnly} 个（不在下方清单；本地独有的由「立即同步」补到备份，备份独有的请用「清理备份冗余」移除）`,
 							],
 						]
 					: []
@@ -1415,7 +1455,11 @@ class VaultICloudSyncPlugin extends Plugin {
 			warns: [
 				'「备份」会用本地版本覆盖备份，「还原」会用备份版本覆盖本地；两个方向都会覆盖对方那一侧的同名文件。',
 				'扫描后又被改动过的文件会在执行时自动跳过，不会覆盖新改动。',
-			],
+			].concat(
+				count.newerLocal
+					? [`其中 ${count.newerLocal} 个文件本地版本比备份新；选「还原」会把它们退回旧版。`]
+					: []
+			),
 		}).ask();
 
 		if (!answer.ok) {
@@ -1445,7 +1489,8 @@ class VaultICloudSyncPlugin extends Plugin {
 			this.running = true;
 		}
 		const started = Date.now();
-		const record = {
+		try {
+			const record = {
 			time: timeText(),
 			ok: false,
 			pushed: 0,
@@ -1455,12 +1500,12 @@ class VaultICloudSyncPlugin extends Plugin {
 			duration: 0,
 			message: '',
 			samples: [],
-		};
+			};
 
-		const notice = new Notice(`正在处理 0/${plan.length}…`, 0);
-		const failed = [];
-		const skipped = [];
-		try {
+			const notice = new Notice(`正在处理 0/${plan.length}…`, 0);
+			const failed = [];
+			const skipped = [];
+			try {
 			for (let i = 0; i < plan.length; i += 1) {
 				const item = plan[i];
 				const row = byRel.get(item.rel);
@@ -1472,7 +1517,9 @@ class VaultICloudSyncPlugin extends Plugin {
 						// 类型冲突：目标侧整路径搬进回收，再把源侧该前缀下的文件复制过去
 						const isPull = item.dir === 'pull';
 						const targetRoot = isPull ? paths.localRoot : paths.remoteRoot;
-						if (!this.movePathToTrash(targetRoot, item.rel, stamp())) {
+						const movedTrash = this.movePathToTrash(targetRoot, item.rel, stamp());
+						// null = 扫描后目标已消失，没东西可搬，直接继续复制（与重验「不存在直接写」同口径）
+						if (movedTrash === '') {
 							throw new Error('目标侧路径未能移入回收目录');
 						}
 						const res = isPull
@@ -1491,7 +1538,11 @@ class VaultICloudSyncPlugin extends Plugin {
 						record.pushed += 1;
 					}
 				} catch (e) {
-					failed.push(`${item.rel}（${e.message}）`);
+					if (e && (e.code === 'EEXIST' || e.code === 'ENOTDIR')) {
+						skipped.push(item.rel);
+					} else {
+						failed.push(`${item.rel}（${e.message}）`);
+					}
 				}
 				if (typeof notice.setMessage === 'function' && i % 50 === 0) {
 					notice.setMessage(`正在处理 ${i + 1}/${plan.length}…`);
@@ -1505,32 +1556,34 @@ class VaultICloudSyncPlugin extends Plugin {
 				: `已处理 ${record.pushed + record.pulled} 项，${failed.length} 项失败（详见日志）。`;
 			record.samples = plan.map((p) => `${p.dir === 'pull' ? '还原' : '备份'}  ${p.rel}`).slice(0, SAMPLE_LIMIT);
 			if (failed.length) this.log(`⚠️ 差异处理失败样例：${failed[0]}`);
-		} finally {
+			} finally {
 			try {
 				notice.hide();
 			} catch (e) {
 				/* ignore */
 			}
-			this.running = false; // 无论是否 skipGuard，到这里任务都归本方法收口
-		}
+			}
 
-		record.duration = Math.round((Date.now() - started) / 100) / 10;
-		this.state.lastPlan = record;
-		await this.saveAll();
-		this.log(
+			record.duration = Math.round((Date.now() - started) / 100) / 10;
+			this.state.lastPlan = record;
+			await this.saveAll();
+			this.log(
 			`差异处理完成：备份 ${record.pushed} · 还原 ${record.pulled} · 跳过 ${record.skipped} · 失败 ${record.failed} · 用时 ${record.duration}s`
-		);
+			);
 
-		const body =
+			const body =
 			`备份 ${record.pushed} · 还原 ${record.pulled}` +
 			(record.skipped ? ` · 跳过 ${record.skipped}（扫描后有变动）` : '') +
 			(record.failed ? ` · 失败 ${record.failed}` : '');
-		if (!record.ok) {
+			if (!record.ok) {
 			new Notice(`⚠️ 差异处理有失败项\n${body}\n详见日志`, 15000);
-		} else {
+			} else {
 			new Notice(`✅ 差异处理完成\n${body}\n用时 ${record.duration}s（还原的文件需 Cmd+R 重载后可见）`, 10000);
+			}
+			return record;
+		} finally {
+			this.running = false; // 构造阶段异常也收口（配合方法开头的 try）
 		}
-		return record;
 	}
 
 	finish(record, started, notice, mode) {
@@ -1539,7 +1592,7 @@ class VaultICloudSyncPlugin extends Plugin {
 		if (mode === 'auto' && record.ok) {
 			this.state.lastAutoDate = dateKey();
 		}
-		this.saveAll();
+		this.saveAll().catch((e) => this.log(`⚠️ 状态写入失败：${e && e.message ? e.message : e}`));
 
 		try {
 			notice.hide();
@@ -1687,7 +1740,7 @@ class ConfirmModal extends Modal {
 			return b;
 		};
 		addBtn('全选', () => {
-			for (const it of this.items) this.selected.add(it.path);
+			for (const it of this.filteredItems()) this.selected.add(it.path);
 			this.renderRows(true);
 		});
 		addBtn('全不选', () => {
@@ -1695,7 +1748,7 @@ class ConfirmModal extends Modal {
 			this.renderRows(true);
 		});
 		addBtn('反选', () => {
-			for (const it of this.items) {
+			for (const it of this.filteredItems()) {
 				if (this.selected.has(it.path)) this.selected.delete(it.path);
 				else this.selected.add(it.path);
 			}
@@ -1714,14 +1767,18 @@ class ConfirmModal extends Modal {
 		this.renderRows(true);
 	}
 
+	filteredItems() {
+		const kw = this.filterText;
+		return kw ? this.items.filter((it) => it.path.toLowerCase().indexOf(kw) !== -1) : this.items;
+	}
+
 	renderRows(reset) {
 		if (!this.listEl) return;
 		if (reset) {
 			this.listEl.empty();
 			this.shown = 0;
 		}
-		const kw = this.filterText;
-		const rows = kw ? this.items.filter((it) => it.path.toLowerCase().indexOf(kw) !== -1) : this.items;
+		const rows = this.filteredItems();
 		const next = rows.slice(this.shown, this.shown + PLAN_CHUNK);
 
 		for (const it of next) {

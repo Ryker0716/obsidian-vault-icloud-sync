@@ -1,7 +1,7 @@
 {
   "id": "vault-icloud-sync",
   "name": "Vault iCloud Sync",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "minAppVersion": "1.4.0",
   "description": "每天首次启动 Obsidian 后用 rsync 把本地 vault 单向同步到 iCloud 备份目录；提供差异清单逐项备份/还原、按备份恢复、清理备份冗余。",
   "author": "Ryker0716",

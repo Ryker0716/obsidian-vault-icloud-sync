@@ -676,6 +676,174 @@ async function scenario(name, fn) {
 		assert(msg.indexOf('多余 1') !== -1, `提示应含多余数：${msg}`);
 	});
 
+
+	/* ---------------- 1.3.1 复审修复回归 ---------------- */
+	await scenario('占位口径：点目录下的普通 .icloud 文件不再误判（P1）', async () => {
+		w(path.join(LOCAL, 'a.md'), 'A');
+		w(path.join(BACKUP, 'a.md'), 'A');
+		w(path.join(BACKUP, 'sub', '.config', 'x.icloud'), 'real-file'); // 点前缀由目录段提供，不是占位
+		w(path.join(BACKUP, 'sub', '.config', '.evicted.md.icloud'), 'ph'); // 这才是占位
+		const p = makePlugin();
+		p.settings.mirrorDelete = true;
+		const r = await p.runSync('manual');
+		assert(r && r.ok, `同步应成功：${r && r.message}`);
+		assert(
+			!fs.existsSync(path.join(BACKUP, 'sub', '.config', 'x.icloud')),
+			'x.icloud 应作正常冗余项进回收（不是被 --delete 硬删）'
+		);
+		assert(r.trashed >= 1, '应计到 trashed（走回收而不是硬删）');
+		assert(
+			fs.existsSync(path.join(BACKUP, 'sub', '.config', '.evicted.md.icloud')),
+			'真占位仍受 --exclude 保护'
+		);
+	});
+
+	await scenario('真身名提取不吃点目录：带点目录的占位也能豁免本地活文件（P2）', async () => {
+		w(path.join(LOCAL, 'sub', '.config', 'foo.md'), 'alive');
+		w(path.join(LOCAL, 'real.md'), 'R');
+		w(path.join(BACKUP, 'real.md'), 'R');
+		w(path.join(BACKUP, 'sub', '.config', '.foo.md.icloud'), 'placeholder');
+		const p = makePlugin();
+		const r = await p.runRestore();
+		assert(r && r.ok, `恢复应成功：${r && r.message}`);
+		assert.strictEqual(r.trashed, 0, '点目录下备份未下载的活笔记不能被搬进回收');
+		assert(fs.existsSync(path.join(LOCAL, 'sub', '.config', 'foo.md')), 'foo.md 必须原地保留');
+	});
+
+	await scenario('冲突行目标扫描后消失：继续复制不误报失败（P3）', async () => {
+		w(path.join(LOCAL, 'foo', 'inner.md'), 'I');
+		w(path.join(BACKUP, 'foo'), 'old-file');
+		const p = makePlugin();
+		stub.setPlanHook((modal) => {
+			// 弹框期间在「备份侧」把冲突目标删了
+			fs.unlinkSync(path.join(BACKUP, 'foo'));
+			const row = modal.rows.find((r) => r.rel === 'foo');
+			modal.selected.add('foo');
+			modal.renderRows(true);
+			const btn = [];
+			stub.walk(modal.contentEl, (el) => {
+				if (el.tag === 'button' && /mod-cta/.test(el.cls)) btn.push(el);
+			});
+			btn[0].listeners.click();
+		});
+		const r = await p.openDiffPlan();
+		assert(r && r.ok, `目标已消失应直接复制成功，不应报失败：${r && r.message}`);
+		assert.strictEqual(r.failed, 0, '不应计失败');
+		assert(fs.statSync(path.join(BACKUP, 'foo')).isDirectory(), '备份侧应建成目录');
+		assert.strictEqual(fs.readFileSync(path.join(BACKUP, 'foo', 'inner.md'), 'utf8'), 'I');
+	});
+
+	await scenario('镜像删除：本地呈占位形态的文件，其备份真身豁免（P4）', async () => {
+		w(path.join(LOCAL, 'a.md'), 'A');
+		w(path.join(LOCAL, '.foo.md.icloud'), 'local-placeholder'); // 本地被驱逐，备份有真身
+		w(path.join(BACKUP, 'a.md'), 'A');
+		w(path.join(BACKUP, 'foo.md'), 'alive-backup');
+		w(path.join(BACKUP, 'gone.md'), 'G');
+		const p = makePlugin();
+		p.settings.mirrorDelete = true;
+		const r = await p.runSync('manual');
+		assert(r && r.ok, `同步应成功：${r && r.message}`);
+		assert(fs.existsSync(path.join(BACKUP, 'foo.md')), '备份真身不能被搬走（本地只是没下载）');
+		assert(!fs.existsSync(path.join(BACKUP, 'gone.md')), '真正的冗余仍被移走');
+	});
+
+	await scenario('恢复弹框「全选 / 反选」随筛选（P6）', async () => {
+		w(path.join(LOCAL, 'a.md'), 'A');
+		w(path.join(BACKUP, 'a.md'), 'A');
+		w(path.join(BACKUP, 'keep1.md'), 'K1');
+		w(path.join(BACKUP, 'keep2.md'), 'K2');
+		w(path.join(BACKUP, 'dead1.md'), 'D1');
+		const p = makePlugin();
+		stub.setPlanHook((modal) => {
+			modal.filterText = 'keep';
+			modal.renderRows(true);
+			let all = null;
+			stub.walk(modal.contentEl, (el) => {
+				if (el.tag === 'button' && el.text === '全选') all = el;
+			});
+			all.listeners.click(); // 应只选中筛选结果里的 keep1 / keep2
+			const btn = [];
+			stub.walk(modal.contentEl, (el) => {
+				if (el.tag === 'button' && /mod-cta|mod-warning/.test(el.cls)) btn.push(el);
+			});
+			btn[0].listeners.click();
+		});
+		const r = await p.runRestore();
+		assert(r && r.ok, `恢复应成功：${r && r.message}`);
+		assert(fs.existsSync(path.join(LOCAL, 'keep1.md')), '筛选命中的应恢复');
+		assert(fs.existsSync(path.join(LOCAL, 'keep2.md')), '筛选命中的应恢复');
+		assert(!fs.existsSync(path.join(LOCAL, 'dead1.md')), '筛选外的不应被全选恢复');
+	});
+
+	await scenario('恢复全部跳过时的提示含「跳过」而不是「一致」（P7）', async () => {
+		w(path.join(LOCAL, 'b.md'), 'B1');
+		w(path.join(BACKUP, 'b.md'), 'B2-longer');
+		const before = stub.notices.length;
+		global.__SELECT_ONLY = ['b.md'];
+		const p = makePlugin();
+		global.__SELECT_ONLY = null;
+		stub.setPlanHook(() => {
+			fs.writeFileSync(path.join(LOCAL, 'b.md'), 'B3-new');
+			const now = Math.floor(Date.now() / 1000);
+			fs.utimesSync(path.join(LOCAL, 'b.md'), now, now);
+			return false;
+		});
+		global.__SELECT_ONLY = ['b.md'];
+		const r = await p.runRestore();
+		global.__SELECT_ONLY = null;
+		assert(r && r.ok);
+		const msg = stub.notices.slice(before).find((n) => n.indexOf('跳过') !== -1);
+		assert(msg, '应提示全部跳过');
+		assert(!stub.notices.slice(before).some((n) => n.indexOf('本地内容与备份一致') !== -1), '不该再说一致');
+	});
+
+	await scenario('差异清单提示「本地比备份新」的文件数（P10）', async () => {
+		w(path.join(LOCAL, 'b.md'), 'B1-local-version');
+		w(path.join(BACKUP, 'b.md'), 'B2');
+		// 本地 mtime 比备份晚
+		const later = T + 600;
+		fs.utimesSync(path.join(LOCAL, 'b.md'), later, later);
+		let warns2 = null;
+		const p = makePlugin();
+		stub.setPlanHook((modal) => {
+			warns2 = modal.opts.warns;
+			modal.close();
+		});
+		await p.openDiffPlan();
+		assert(warns2 && warns2.some((x) => x.indexOf('比备份新') !== -1), `应有本地较新警告：${warns2}`);
+	});
+
+	await scenario('只勾选冲突行的子孙项时按跳过算（P11）', async () => {
+		w(path.join(LOCAL, 'foo'), 'local-file');
+		w(path.join(BACKUP, 'foo', 'inner.md'), 'inner');
+		global.__SELECT_ONLY = ['foo/inner.md'];
+		const p = makePlugin();
+		const r = await p.runRestore();
+		global.__SELECT_ONLY = null;
+		assert(r && r.ok, `应成功：${r && r.message}`);
+		assert.strictEqual(r.failed, 0, '父路径冲突挡着算跳过，不算失败');
+		assert.strictEqual(r.skipped, 1, '应记 1 项跳过');
+		assert(fs.statSync(path.join(LOCAL, 'foo')).isFile(), '本地 foo 必须原样保留');
+	});
+
+	await scenario('搬迁失败时 --delete 不硬删失败项（理论 3）', async () => {
+		w(path.join(LOCAL, 'a.md'), 'A');
+		w(path.join(BACKUP, 'a.md'), 'A');
+		w(path.join(BACKUP, 'gone.md'), 'G');
+		// 把回收目录预先做成一个文件 → moveExtrasToTrash 全部失败，注入搬迁失败
+		fs.writeFileSync(path.join(BACKUP, '.vault-sync-trash'), 'blocker');
+		const p = makePlugin();
+		p.settings.mirrorDelete = true;
+		const r = await p.runSync('manual');
+		assert(fs.existsSync(path.join(BACKUP, 'gone.md')), '搬迁失败的文件必须被 exclude 保护，不能被 --delete 硬删');
+		assert(!fs.existsSync(path.join(BACKUP, '.vault-sync-trash', '20261027-x')), '不应出现假批次');
+		fs.unlinkSync(path.join(BACKUP, '.vault-sync-trash')); // 还原注入
+		const p2 = makePlugin();
+		p2.settings.mirrorDelete = true;
+		const r2 = await p2.runSync('manual');
+		assert(!fs.existsSync(path.join(BACKUP, 'gone.md')), '恢复回收目录后，冗余应能正常进回收');
+	});
+
 	console.log('\n' + results.join('\n'));
 	console.log(process.exitCode ? '\n❌ 有失败用例' : '\n✅ 全部通过');
 	fs.rmSync(TMP, { recursive: true, force: true });
