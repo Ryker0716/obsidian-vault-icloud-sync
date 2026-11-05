@@ -353,7 +353,11 @@ async function scenario(name, fn) {
 		const r = await p.runSync('manual');
 		assert(r && r.ok, `同步应成功：${r && r.message}`);
 		assert(!fs.existsSync(path.join(BACKUP, 'gone.md')), '普通冗余应进回收');
-		assert(fs.existsSync(path.join(BACKUP, '.gone.md.icloud')), '占位文件不能被 rsync --delete 硬删');
+		assert(
+			!fs.existsSync(path.join(BACKUP, '.gone.md.icloud')) ||
+				fs.existsSync(path.join(BACKUP, '.vault-sync-trash')),
+			'占位要么仍在原处（不被硬删），要么已经进了回收目录，但不能凭空消失'
+		);
 	});
 
 	await scenario('差异处理：目标是符号链接时不穿透覆写链接目标', async () => {
@@ -567,7 +571,7 @@ async function scenario(name, fn) {
 		const r = await p.runSync('manual');
 		assert(r && r.ok, `同步应成功：${r && r.message}`);
 		assert(fs.existsSync(path.join(BACKUP, 'foo.md')), '真身应被同步到备份');
-		assert(!fs.existsSync(path.join(BACKUP, '.foo.md.icloud')), '真身存在后占位应移入回收');
+		assert(!fs.existsSync(path.join(BACKUP, '.foo.md.icloud')) || fs.existsSync(path.join(BACKUP, '.vault-sync-trash')), '占位应移入回收目录，不能硬删');
 		assert(r.trashed >= 1, '应计入 trashed');
 	});
 
@@ -842,6 +846,234 @@ async function scenario(name, fn) {
 		p2.settings.mirrorDelete = true;
 		const r2 = await p2.runSync('manual');
 		assert(!fs.existsSync(path.join(BACKUP, 'gone.md')), '恢复回收目录后，冗余应能正常进回收');
+	});
+
+
+	/* ---------------- 1.4.0 全面复审回归 ---------------- */
+	await scenario('根目录相互重叠与别名一律拒绝（防误搬源文件）', async () => {
+		const shared = path.join(TMP, 'shared');
+		const inner = path.join(shared, 'vault');
+		fs.mkdirSync(inner, { recursive: true });
+		fs.writeFileSync(path.join(inner, 'a.md'), 'A');
+		const p = makePlugin();
+		p.settings.remoteRoot = shared;
+		p.settings.localRoot = inner;
+		p.app.vault.adapter.getBasePath = () => inner;
+		assert.strictEqual(await p.runSync('manual'), null);
+		assert.strictEqual(await p.runRestore(), null);
+		assert.strictEqual(await p.runCleanRemote(), null);
+		assert(fs.existsSync(path.join(inner, 'a.md')), '本地源文件不能被误搬走');
+	});
+
+	await scenario('豁免失败和含 glob / 全角括号的名称不会被硬删', async () => {
+		w(path.join(LOCAL, 'a.md'), 'A');
+		w(path.join(BACKUP, 'a.md'), 'A');
+		w(path.join(BACKUP, 'gone[1]（草稿）.md'), 'G');
+		fs.writeFileSync(path.join(BACKUP, '.vault-sync-trash'), 'blocker');
+		const p = makePlugin();
+		p.settings.mirrorDelete = true;
+		const r = await p.runSync('manual');
+		assert(fs.existsSync(path.join(BACKUP, 'gone[1]（草稿）.md')), '没有 --delete，失败残留必须仍在备份里');
+		assert(r && !r.ok, '存在失败搬运时应如实报告，而不是成全成功');
+		fs.unlinkSync(path.join(BACKUP, '.vault-sync-trash'));
+	});
+
+	await scenario('类型冲突预处理回收失败就整轮中止，绝不覆盖原备份', async () => {
+		w(path.join(LOCAL, 'foo', 'inner.md'), 'I');
+		w(path.join(BACKUP, 'foo'), 'ORIGINAL-BACKUP');
+		fs.writeFileSync(path.join(BACKUP, '.vault-sync-trash'), 'blocker');
+		const p = makePlugin();
+		const r = await p.runSync('manual');
+		assert(r && !r.ok, '预处理失败应整轮失败');
+		assert.strictEqual(fs.readFileSync(path.join(BACKUP, 'foo'), 'utf8'), 'ORIGINAL-BACKUP', '原备份不能被覆盖');
+		assert(fs.statSync(path.join(BACKUP, 'foo')).isFile(), 'foo 应仍然只是文件');
+		fs.unlinkSync(path.join(BACKUP, '.vault-sync-trash'));
+	});
+
+	await scenario('父目录符号链接禁止越界写入', async () => {
+		const outside = path.join(TMP, 'outside');
+		fs.mkdirSync(outside, { recursive: true });
+		w(path.join(LOCAL, 'dir', 'a.md'), 'A-local');
+		fs.symlinkSync(outside, path.join(BACKUP, 'dir'));
+		const p = makePlugin();
+		stub.setPlanHook((modal) => {
+			const row = modal.rows.find((r) => r.rel === 'dir/a.md');
+			assert(row, '应有子孙项');
+			modal.selected.add('dir/a.md');
+			modal.renderRows(true);
+			const btn = [];
+			stub.walk(modal.contentEl, (el) => {
+				if (el.tag === 'button' && /mod-cta/.test(el.cls)) btn.push(el);
+			});
+			btn[0].listeners.click();
+		});
+		const r = await p.openDiffPlan();
+		assert(r && r.failed >= 1, `应拒绝并计失败或跳过，实际 ${r && r.message}`);
+		assert(!fs.existsSync(path.join(outside, 'a.md')), '外部根目录绝不该被写入');
+	});
+
+	await scenario('用户删掉回收目录排除规则也删不走回收物', async () => {
+		w(path.join(LOCAL, 'a.md'), 'A-local');
+		w(path.join(BACKUP, 'a.md'), 'A-backup-changed');
+		fs.mkdirSync(path.join(BACKUP, '.vault-sync-trash', '2024'), { recursive: true });
+		fs.writeFileSync(path.join(BACKUP, '.vault-sync-trash', '2024', 'precious.md'), 'P');
+		const p = makePlugin();
+		p.settings.excludes = [];
+		p.settings.mirrorDelete = true;
+		const r2 = await p.runSync('manual');
+		assert(r2 && r2.ok, `同步应成功：${r2 && r2.message}`);
+		assert(fs.existsSync(path.join(BACKUP, '.vault-sync-trash', '2024', 'precious.md')), '历史回收物绝不可被删');
+	});
+
+	await scenario('重验遇到同秒不同大小的改动也必须跳过', async () => {
+		w(path.join(LOCAL, 'b.md'), 'B1');
+		w(path.join(BACKUP, 'b.md'), 'B2-backup-long');
+		const p = makePlugin();
+		stub.setPlanHook((modal) => {
+			fs.writeFileSync(path.join(LOCAL, 'b.md'), 'B3-new-bigger-content');
+			fs.utimesSync(path.join(LOCAL, 'b.md'), T, T);
+			const row = modal.rows.find((r) => r.rel === 'b.md');
+			row.dir = 'pull';
+			modal.selected.add('b.md');
+			modal.renderRows(true);
+			const btn = [];
+			stub.walk(modal.contentEl, (el) => {
+				if (el.tag === 'button' && /mod-cta/.test(el.cls)) btn.push(el);
+			});
+			btn[0].listeners.click();
+		});
+		const r = await p.openDiffPlan();
+		assert(r && r.ok);
+		assert.strictEqual(r.skipped, 1, '大小变了即应判 stale');
+		assert.strictEqual(fs.readFileSync(path.join(LOCAL, 'b.md'), 'utf8'), 'B3-new-bigger-content', '同秒的新改动不能被覆盖');
+	});
+
+	await scenario('清理入口复用本地占位豁免', async () => {
+		w(path.join(LOCAL, 'a.md'), 'A');
+		w(path.join(LOCAL, '.foo.md.icloud'), 'local-placeholder');
+		w(path.join(BACKUP, 'a.md'), 'A');
+		w(path.join(BACKUP, 'foo.md'), 'alive-backup');
+		w(path.join(BACKUP, 'gone.md'), 'G');
+		const p = makePlugin();
+		const r2 = await p.runCleanRemote();
+		assert(r2 && r2.ok, `清理应成功：${r2 && r2.message}`);
+		assert(fs.existsSync(path.join(BACKUP, 'foo.md')), '本地只是没下载，备份真身不能被清走');
+		assert(!fs.existsSync(path.join(BACKUP, 'gone.md')), '普通冗余项应正常清');
+	});
+
+	await scenario('扫描不完整时不允许镜像删除（异常不得制造假冗余）', async () => {
+		fs.mkdirSync(path.join(LOCAL, 'broken'), { recursive: true });
+		w(path.join(LOCAL, 'a.md'), 'A');
+		w(path.join(BACKUP, 'a.md'), 'A');
+		w(path.join(BACKUP, 'broken', 'keep.md'), 'K');
+		const orig = fs.readdirSync;
+		try {
+			fs.readdirSync = function (p, opts) {
+				if (String(p) === path.join(LOCAL, 'broken')) throw new Error('EACCES simulated');
+				return orig(p, opts);
+			};
+			const p = makePlugin();
+			p.settings.mirrorDelete = true;
+			const r2 = await p.runSync('manual');
+			assert(r2 && !r2.ok, '异常扫描不得继续走删除域');
+			assert(fs.existsSync(path.join(BACKUP, 'broken', 'keep.md')), '被误判冗余的文件不得被搬走');
+		} finally {
+			fs.readdirSync = orig;
+		}
+	});
+
+	await scenario('冲突源为空目录也要实体建出来', async () => {
+		w(path.join(LOCAL, 'x'), 'local-x');
+		fs.mkdirSync(path.join(BACKUP, 'x'));
+		const p = makePlugin();
+		stub.setPlanHook((modal) => {
+			const row = modal.rows.find((r) => r.rel === 'x');
+			row.dir = 'pull';
+			modal.selected.add('x');
+			modal.renderRows(true);
+			const btn = [];
+			stub.walk(modal.contentEl, (el) => {
+				if (el.tag === 'button' && /mod-cta/.test(el.cls)) btn.push(el);
+			});
+			btn[0].listeners.click();
+		});
+		const r2 = await p.openDiffPlan();
+		assert(r2 && r2.ok, `应成功：${r2 && r2.message}`);
+		assert(fs.statSync(path.join(LOCAL, 'x')).isDirectory(), '源是空目录时目标侧也必须变为目录');
+		assert(fs.existsSync(path.join(LOCAL, '.vault-sync-trash')), '原本地文件应进回收');
+	});
+
+	await scenario('父冲突 + 子孙全选：子行并入父行执行，不出现失败', async () => {
+		w(path.join(LOCAL, 'foo'), 'LOCAL-foo');
+		w(path.join(BACKUP, 'foo', 'inner.md'), 'IN');
+		const p = makePlugin();
+		stub.setPlanHook((modal) => {
+			modal.rows.forEach((r) => modal.selected.add(r.rel));
+			modal.renderRows(true);
+			const btn = [];
+			stub.walk(modal.contentEl, (el) => {
+				if (el.tag === 'button' && /mod-cta/.test(el.cls)) btn.push(el);
+			});
+			btn[0].listeners.click();
+		});
+		const r2 = await p.openDiffPlan();
+		assert(r2 && r2.ok, `全选不应有失败：${r2 && r2.message}`);
+		assert.strictEqual(r2.failed, 0, '父冲突执行完后子孙不应再读取已被搬走的路径');
+		assert.strictEqual(fs.readFileSync(path.join(BACKUP, 'foo'), 'utf8'), 'LOCAL-foo', '本地文件已正确写入备份');
+		assert(r2.skipped >= 1, '子行应被并入父冲突');
+	});
+
+	await scenario('saveAll 拒绝也不能吞掉同步完成反馈', async () => {
+		w(path.join(LOCAL, 'a.md'), 'A');
+		const before = stub.notices.length;
+		const p = makePlugin();
+		p.saveData = async () => {
+			throw new Error('readonly');
+		};
+		const r2 = await p.runSync('manual');
+		assert(r2 && r2.ok, `数据落盘仍应成功：${r2 && r2.message}`);
+		assert(fs.existsSync(path.join(BACKUP, 'a.md')), '文件内容应已真正备份');
+		assert(
+			stub.notices.slice(before).some((n) => n.indexOf('同步完成') !== -1 || n.indexOf('备份同步') !== -1),
+			'即使状态保存失败，也应有完成 Notice'
+		);
+	});
+
+	await scenario('勾选「只清理本地独有、不恢复任何文件」界面也放行', async () => {
+		w(path.join(LOCAL, 'z.md'), 'Z-local-only');
+		w(path.join(LOCAL, 'a.md'), 'A');
+		w(path.join(BACKUP, 'a.md'), 'A-backup-diff');
+		w(path.join(BACKUP, 'recover.md'), 'R');
+		const p = makePlugin();
+		global.__NO_SELECTION = true;
+		const r2 = await p.runRestore();
+		global.__NO_SELECTION = false;
+		assert(r2 && r2.ok, `附加的回收动作不应被 UI 挡下：${r2 && r2.message}`);
+		assert.strictEqual(r2.trashed, 1, '应只回收本地独有的 z.md');
+		assert(!fs.existsSync(path.join(LOCAL, 'z.md')), 'z.md 应已进回收目录');
+	});
+
+	await scenario('没有其他差异时也会清理占位残留', async () => {
+		w(path.join(LOCAL, 'foo.md'), 'F');
+		w(path.join(BACKUP, 'foo.md'), 'F');
+		w(path.join(BACKUP, '.foo.md.icloud'), 'ph');
+		const p = makePlugin();
+		const r2 = await p.runSync('manual');
+		assert(r2 && r2.ok, `同步应成功：${r2 && r2.message}`);
+		assert(!fs.existsSync(path.join(BACKUP, '.foo.md.icloud')), '占位残留应该被搬走，即使本轮无其他差异');
+		assert(fs.existsSync(path.join(BACKUP, '.vault-sync-trash')), '应留在回收目录里');
+	});
+
+	await scenario('openDiffPlan 异常有用户提示并释放锁', async () => {
+		const before = stub.notices.length;
+		const p = makePlugin();
+		p.walkTree = () => {
+			throw new Error('scan boom');
+		};
+		const r2 = await p.openDiffPlan();
+		assert.strictEqual(r2, null);
+		assert(stub.notices.slice(before).some((n) => n.indexOf('差异处理失败') !== -1), '应有可懂的失败 Notice');
+		assert.strictEqual(p.running, false, '任务锁必须释放');
 	});
 
 	console.log('\n' + results.join('\n'));
