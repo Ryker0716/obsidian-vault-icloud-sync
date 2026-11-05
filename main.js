@@ -1344,7 +1344,8 @@ class VaultICloudSyncPlugin extends Plugin {
 				new Notice(`⚠️ 恢复有失败项\n${body}\n详见日志`, 15000);
 			} else if (record.created + record.updated === 0) {
 				const zeroText = record.skipped
-					? `ℹ️ 勾选的 ${record.skipped} 项在扫描后都发生了变动，已全部跳过（未做任何改动）`
+					? `ℹ️ 跳过 ${record.skipped} 项（扫描后有变动）` +
+						(record.trashed ? `；另有 ${record.trashed} 项已移入回收目录` : '，未恢复任何文件')
 					: record.trashed
 						? `✅ 已把 ${record.trashed} 个本地独有文件移入回收目录`
 						: '✅ 已确认：本地内容与备份一致';
